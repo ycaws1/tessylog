@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()  # runs on startup
+    # init_db()  # runs on startup
     yield
     # anything after yield runs on shutdown
 
