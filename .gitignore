@@ -6,7 +6,6 @@ guide.md
 tesla.sh
 tesla.db
 ngrok.sh
-database.py
 
 .DS_Store
 server/*
