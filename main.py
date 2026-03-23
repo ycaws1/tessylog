@@ -21,8 +21,8 @@ app = FastAPI(lifespan=lifespan)
 
 client_id = os.getenv("CLIENT_ID")
 client_secret = os.getenv("CLIENT_SECRET")
-redirect_uri = os.getenv("REDIRECT_URI")
 audience = os.getenv("AUDIENCE")
+redirect_uri = os.getenv("REDIRECT_URI")
 
 @app.get("/")
 def read_root():
