@@ -10,3 +10,4 @@ database.py
 
 .DS_Store
 server/*
+fleet_telemetry/*

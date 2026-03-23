@@ -7,7 +7,7 @@ import secrets
 from dotenv import load_dotenv
 load_dotenv()  # must be before os.getenv() calls
 
-from database import init_db, save_tokens, get_tokens, save_state, verify_and_delete_state
+# from database import init_db, save_tokens, get_tokens, save_state, verify_and_delete_state
 
 from contextlib import asynccontextmanager
 
