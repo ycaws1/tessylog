@@ -6,6 +6,7 @@ import os
 import secrets
 from dotenv import load_dotenv
 load_dotenv()  # must be before os.getenv() calls
+import requests
 
 # from database import init_db, save_tokens, get_tokens, save_state, verify_and_delete_state
 
@@ -23,6 +24,8 @@ client_id = os.getenv("CLIENT_ID")
 client_secret = os.getenv("CLIENT_SECRET")
 audience = os.getenv("AUDIENCE")
 redirect_uri = os.getenv("REDIRECT_URI")
+TOKEN_URL = "https://auth.tesla.com/oauth2/v3/token"
+
 
 @app.get("/")
 def read_root():
@@ -34,6 +37,51 @@ def get_tesla_public_key():
     if os.path.exists(public_key_path):
         return FileResponse(public_key_path)
     return {"error": "Public key file not found"}, 404
+
+
+@app.get("/callback")
+async def tesla_callback(code: str, state: str = None, issuer: str = None):
+    """
+    Catches the authorization code from Tesla and exchanges it for tokens.
+    """
+    if not code:
+        return {"error": "No authorization code provided by Tesla."}
+
+    # 1. Prepare the payload for the token exchange
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "audience": audience,
+        "redirect_uri": redirect_uri
+    }
+
+    # 2. Make the POST request to Tesla's Auth server
+    print("Exchanging authorization code for tokens...")
+    response = requests.post(TOKEN_URL, data=payload)
+
+    if response.status_code == 200:
+        token_data = response.json()
+        
+        # These are what you need to make API calls on behalf of the car owner
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+        
+        # TODO: Store these securely in your database (e.g., Supabase).
+        # Remember to map these tokens to the specific user in your system.
+        
+        print("Success! Tokens retrieved.")
+        
+        # 3. Redirect the user to your frontend dashboard
+        # Replace '/dashboard' with your actual Next.js frontend route
+        return RedirectResponse(url="/dashboard")
+        
+    else:
+        print(f"Token exchange failed: {response.text}")
+        return {"error": "Failed to exchange token", "details": response.json()}
+
+
 
 
 # # ─── Step 1: Kick off OAuth ───────────────────────────────────────────────────
