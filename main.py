@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()  # must be before os.getenv() calls
 import requests
 
-# from database import init_db, save_tokens, get_tokens, save_state, verify_and_delete_state
+from database import save_tokens, get_tokens, save_state, verify_and_delete_state
 
 from contextlib import asynccontextmanager
 
@@ -68,10 +68,10 @@ async def tesla_callback(code: str, state: str = None, issuer: str = None):
         access_token = token_data.get("access_token")
         refresh_token = token_data.get("refresh_token")
         
-        # TODO: Store these securely in your database (e.g., Supabase).
-        # Remember to map these tokens to the specific user in your system.
+        # Store these securely in Supabase
+        save_tokens(access_token, refresh_token)
         
-        print("Success! Tokens retrieved.")
+        print("Success! Tokens retrieved and saved to Supabase.")
         
         # 3. Redirect the user to your frontend dashboard
         # Replace '/dashboard' with your actual Next.js frontend route
