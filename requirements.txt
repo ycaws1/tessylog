@@ -3,5 +3,4 @@ uvicorn
 httpx
 python-dotenv
 requests
-supabase-py
 supabase

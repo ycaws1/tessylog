@@ -1,254 +1,228 @@
-from typing import Optional
-from fastapi import FastAPI, Query, Request, HTTPException
-from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
-import httpx
 import os
+import time
 import secrets
-from dotenv import load_dotenv
-load_dotenv()  # must be before os.getenv() calls
 import requests
-
-from database import save_tokens, get_tokens, save_state, verify_and_delete_state
-
+import urllib.parse
 from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSONResponse
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Configuration from environment variables
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+# Ensure REDIRECT_URI is stripped of whitespace
+REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip()
+SCOPES = "openid offline_access vehicle_device_data vehicle_cmds vehicle_charging_cmds"
+AUDIENCE = os.getenv("AUDIENCE", "https://fleet-api.prd.na.vn.cloud.tesla.com")
+
+print(CLIENT_ID)
+print(CLIENT_SECRET)
+print(REDIRECT_URI)
+print(SCOPES)
+print(AUDIENCE)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # init_db()  # runs on startup
+    # Startup logic here if needed
     yield
-    # anything after yield runs on shutdown
+    # Shutdown logic here if needed
 
 app = FastAPI(lifespan=lifespan)
 
-client_id = os.getenv("CLIENT_ID")
-client_secret = os.getenv("CLIENT_SECRET")
-audience = os.getenv("AUDIENCE")
-redirect_uri = os.getenv("REDIRECT_URI")
-TOKEN_URL = "https://auth.tesla.com/oauth2/v3/token"
+class TeslaAPI:
+    def __init__(self, client_id, client_secret, redirect_uri, scopes):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.redirect_uri = redirect_uri
+        self.scopes = scopes
+        self.tokens = {}
+        self.state = secrets.token_urlsafe(32)
 
+    def valid(self):
+        return self.tokens and (int(time.time()) - self.tokens.get("obtained_at", 0) < self.tokens.get("expires_in", 0) - 60)
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+    def refresh(self):
+        r = requests.post("https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token", data={
+            "grant_type": "refresh_token",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "refresh_token": self.tokens["refresh_token"]
+        }).json()
+        r["obtained_at"] = int(time.time())
+        self.tokens.update(r)
+
+    def api_get(self, path):
+        if not self.valid():
+            if "refresh_token" in self.tokens:
+                self.refresh()
+            else:
+                return None
+        return requests.get(
+            f"{AUDIENCE}{path}",
+            headers={"Authorization": f"Bearer {self.tokens['access_token']}"}
+        )
+
+    def api_post(self, path):
+        if not self.valid():
+            if "refresh_token" in self.tokens:
+                self.refresh()
+            else:
+                return None
+        return requests.post(
+            f"{AUDIENCE}{path}",
+            headers={"Authorization": f"Bearer {self.tokens['access_token']}"}
+        )
+
+    def get_vehicles(self):
+        resp = self.api_get("/api/1/vehicles")
+        if resp is None: return []
+        try:
+            return resp.json().get('response', [])
+        except Exception:
+            return []
+
+    def get_vehicle_state(self, vid):
+        vehicles = self.get_vehicles()
+        vehicle = next((v for v in vehicles if str(v.get('id')) == str(vid)), None)
+        return vehicle.get('state') if vehicle else None
+
+    def wake_up_vehicle(self, vid):
+        return self.api_post(f"/api/1/vehicles/{vid}/wake_up")
+
+    def get_vehicle_data(self, vid):
+        return self.api_get(f"/api/1/vehicles/{vid}/vehicle_data")
+
+tesla_api = TeslaAPI(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES)
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    if not tesla_api.tokens:
+        url = "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/authorize?" + urllib.parse.urlencode({
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "response_type": "code",
+            "scope": SCOPES,
+            "state": tesla_api.state
+        })
+        return f"<h1>Tesla Fleet</h1><a href='{url}'>Login with Tesla</a>"
+    
+    cars = tesla_api.get_vehicles()
+    return "<h1>Your Vehicles</h1>" + "".join(
+        f"<p><a href='/vehicle/{c['id']}'>{c['display_name']} ({c['vin']})</a></p>"
+        for c in cars
+    )
+
+@app.get("/auth/callback")
+async def callback(request: Request):
+    params = dict(request.query_params)
+    
+    if "error" in params:
+        return HTMLResponse(content=f"<h1>Tesla OAuth Error</h1><pre>{params}</pre>", status_code=400)
+
+    # Validate state parameter
+    state = params.get("state")
+    if state != tesla_api.state:
+        return HTMLResponse(content="<h1>Invalid state parameter (possible CSRF)</h1>", status_code=400)
+
+    code = params.get("code")
+    if not code:
+        return HTMLResponse(content=f"<pre>{params}</pre>", status_code=400)
+
+    resp = requests.post("https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token", data={
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": REDIRECT_URI
+    })
+    
+    if resp.status_code != 200:
+        return HTMLResponse(content=f"<h1>Token Exchange Failed</h1><pre>{resp.text}</pre>", status_code=400)
+    
+    token = resp.json()
+    token["obtained_at"] = int(time.time())
+    tesla_api.tokens.update(token)
+    return RedirectResponse(url="/")
+
+@app.get("/vehicle/{vid}", response_class=HTMLResponse)
+async def vehicle(vid: str):
+    # 1. Get vehicle state (without waking up)
+    state = tesla_api.get_vehicle_state(vid)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Vehicle not found in account.")
+    
+    # 2. If not online, try to wake up
+    if state != 'online':
+        wake_resp = tesla_api.wake_up_vehicle(vid)
+        try:
+            wake_data = wake_resp.json()
+        except Exception:
+            return HTMLResponse(content=f"<h2>Wake up command failed (non-JSON response):</h2><pre>{wake_resp.text}</pre>", status_code=500)
+        
+        # 3. Poll for 'online' state, up to 5 times
+        for attempt in range(5):
+            time.sleep(2)
+            poll_state = tesla_api.get_vehicle_state(vid)
+            if poll_state == 'online':
+                break
+        else:
+            return HTMLResponse(content=f"<h2>Vehicle did not wake up after several attempts.</h2><pre>{wake_data}</pre>", status_code=500)
+    
+    # 4. Fetch vehicle data
+    data_resp = tesla_api.get_vehicle_data(vid)
+    try:
+        data = data_resp.json()
+    except Exception:
+        return HTMLResponse(content=f"<h2>Error parsing vehicle data response:</h2><pre>{data_resp.text}</pre>", status_code=500)
+
+    # Pretty-print: flatten top-level keys and show as HTML table
+    def render_dict(d, parent_key=""):
+        rows = []
+        for k, v in d.items():
+            key = f"{parent_key}.{k}" if parent_key else k
+            if isinstance(v, dict):
+                rows.extend(render_dict(v, key))
+            else:
+                rows.append(f"<tr><td>{key}</td><td>{v}</td></tr>")
+        return rows
+
+    vehicle_info = data.get('response', {})
+    table_rows = render_dict(vehicle_info)
+    html = f'''
+    <html>
+    <head>
+    <style>
+        body {{ font-family: Arial, sans-serif; background: #f8f8f8; }}
+        table {{ border-collapse: collapse; width: 80%; margin: 2em auto; background: #fff; }}
+        th, td {{ border: 1px solid #ccc; padding: 8px 12px; }}
+        th {{ background: #eee; }}
+        tr:nth-child(even) {{ background: #f2f2f2; }}
+        h2 {{ text-align: center; }}
+    </style>
+    </head>
+    <body>
+    <h2>Vehicle Data</h2>
+    <table>
+        <tr><th>Field</th><th>Value</th></tr>
+        {''.join(table_rows)}
+    </table>
+    </body>
+    </html>
+    '''
+    return html
 
 @app.get("/.well-known/appspecific/com.tesla.3p.public-key.pem")
 def get_tesla_public_key():
     public_key_path = os.path.join(os.getcwd(), "certs", "public-key.pem")
     if os.path.exists(public_key_path):
         return FileResponse(public_key_path)
-    return {"error": "Public key file not found"}, 404
+    return JSONResponse(content={"error": "Public key file not found"}, status_code=404)
 
-
-@app.get("/callback")
-async def tesla_callback(code: str, state: str = None, issuer: str = None):
-    """
-    Catches the authorization code from Tesla and exchanges it for tokens.
-    """
-    if not code:
-        return {"error": "No authorization code provided by Tesla."}
-
-    # 1. Prepare the payload for the token exchange
-    payload = {
-        "grant_type": "authorization_code",
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "code": code,
-        "audience": audience,
-        "redirect_uri": redirect_uri
-    }
-
-    # 2. Make the POST request to Tesla's Auth server
-    print("Exchanging authorization code for tokens...")
-    response = requests.post(TOKEN_URL, data=payload)
-
-    if response.status_code == 200:
-        token_data = response.json()
-        
-        # These are what you need to make API calls on behalf of the car owner
-        access_token = token_data.get("access_token")
-        refresh_token = token_data.get("refresh_token")
-        
-        # Store these securely in Supabase
-        save_tokens(access_token, refresh_token)
-        
-        print("Success! Tokens retrieved and saved to Supabase.")
-        
-        # 3. Redirect the user to your frontend dashboard
-        # Replace '/dashboard' with your actual Next.js frontend route
-        return RedirectResponse(url="/dashboard")
-        
-    else:
-        print(f"Token exchange failed: {response.text}")
-        return {"error": "Failed to exchange token", "details": response.json()}
-
-
-
-
-# # ─── Step 1: Kick off OAuth ───────────────────────────────────────────────────
-# from urllib.parse import urlencode
-
-# @app.get("/auth/login")
-# def login():
-#     state = secrets.token_urlsafe(32)
-#     save_state(state)
-
-#     params = {
-#         "response_type": "code",
-#         "client_id": client_id,
-#         "redirect_uri": redirect_uri,
-#         "scope": "openid offline_access user_data vehicle_device_data vehicle_cmds vehicle_charging_cmds",
-#         "state": state,
-#     }
-
-#     tesla_auth_url = f"https://auth.tesla.com/oauth2/v3/authorize?{urlencode(params)}"
-#     print({"url": tesla_auth_url})
-#     return RedirectResponse(tesla_auth_url)
-
-# # ─── Step 2: Callback ─────────────────────────────────────────────────────────
-
-# @app.get("/callback")
-# async def callback(request: Request):
-#     print(f"DEBUG: Full URL received: {str(request.url)}")
-#     print(f"DEBUG: All params: {dict(request.query_params)}")
-#     code = request.query_params.get("code")
-#     state = request.query_params.get("state")
-#     error = request.query_params.get("error")
-
-#     print(f"DEBUG: Callback received with state: {state}, code: {'present' if code else 'missing'}, error: {error}")
-
-#     if error:
-#         return JSONResponse({"error": error}, status_code=400)
-
-#     if not code or not state:
-#         return JSONResponse({
-#             "error": "Missing params",
-#             "received_url": str(request.url),
-#             "received_params": dict(request.query_params)
-#         }, status_code=400)
-
-#     if not verify_and_delete_state(state):
-#         print(f"DEBUG: State verification failed for state: {state}")
-#         return JSONResponse({"error": "Invalid state — may have expired or server reloaded", "state": state}, status_code=400)
-
-#     async with httpx.AsyncClient() as client:
-#         response = await client.post(
-#             "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token",
-#             data={
-#                 "grant_type": "authorization_code",
-#                 "client_id": client_id,
-#                 "client_secret": client_secret,
-#                 "code": code,
-#                 "redirect_uri": redirect_uri,
-#                 "audience": audience,
-#             },
-#             headers={"Content-Type": "application/x-www-form-urlencoded"},
-#         )
-
-#     print(f"DEBUG: Tesla token response status: {response.status_code}")
-#     if response.status_code != 200:
-#         print(f"DEBUG: Tesla token response body: {response.text}")
-#         return JSONResponse(
-#             {"error": "Token exchange failed", "detail": response.text},
-#             status_code=response.status_code,
-#         )
-
-#     tokens = response.json()
-#     save_tokens(tokens["access_token"], tokens.get("refresh_token"))
-#     return {"message": "Auth successful — tokens saved to DB"}
-
-
-# # ─── Step 3: Refresh ──────────────────────────────────────────────────────────
-
-# @app.post("/auth/refresh")
-# async def refresh_token_endpoint():
-#     stored = get_tokens()
-#     if not stored or not stored.get("refresh_token"):
-#         return JSONResponse({"error": "No refresh token in DB"}, status_code=400)
-
-#     async with httpx.AsyncClient() as client:
-#         response = await client.post(
-#             "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token",
-#             data={
-#                 "grant_type": "refresh_token",
-#                 "client_id": client_id,
-#                 "refresh_token": stored["refresh_token"],
-#             },
-#             headers={"Content-Type": "application/x-www-form-urlencoded"},
-#         )
-
-#     if response.status_code != 200:
-#         return JSONResponse(
-#             {"error": "Refresh failed", "detail": response.text},
-#             status_code=response.status_code,
-#         )
-
-#     tokens = response.json()
-#     save_tokens(tokens["access_token"], tokens.get("refresh_token"))
-
-#     return {"message": "Tokens refreshed and saved"}
-
-# # ─── Utility: inspect stored tokens ──────────────────────────────────────────
-
-# @app.get("/auth/tokens")
-# def inspect_tokens():
-#     stored = get_tokens()
-#     if not stored:
-#         return JSONResponse({"error": "No tokens stored"}, status_code=404)
-#     # Mask tokens for safety
-#     return {
-#         "access_token": stored["access_token"][:20] + "...",
-#         "refresh_token": stored["refresh_token"][:20] + "..." if stored.get("refresh_token") else None,
-#         "updated_at": stored["updated_at"],
-#     }
-
-
-# async def tesla_get(path: str):
-#     """Helper to make authenticated Tesla API calls"""
-#     stored = get_tokens()
-#     if not stored:
-#         return JSONResponse({"error": "No tokens found, please login"}, status_code=401)
-    
-#     async with httpx.AsyncClient() as client:
-#         response = await client.get(
-#             f"{audience}{path}",
-#             headers={"Authorization": f"Bearer {stored['access_token']}"}
-#         )
-    
-#     if response.status_code == 401:
-#         return JSONResponse({"error": "Token expired, call /auth/refresh"}, status_code=401)
-    
-#     return response.json()
-
-# @app.get("/vehicles")
-# async def get_vehicles():
-#     return await tesla_get("/api/1/vehicles")
-
-# @app.get("/vehicles/{vehicle_id}")
-# async def get_vehicle(vehicle_id: str):
-#     return await tesla_get(f"/api/1/vehicles/{vehicle_id}")
-
-# @app.get("/vehicles/{vehicle_id}/state")
-# async def get_vehicle_state(vehicle_id: str):
-#     return await tesla_get(f"/api/1/vehicles/{vehicle_id}/vehicle_data")
-
-# # @app.get("/vehicles/{vehicle_id}/wake")
-# # async def wake_vehicle(vehicle_id: str):
-#     # stored = get_tokens()
-#     # async with httpx.AsyncClient() as client:
-#     #     # Note: audience is already prefixed with https
-#     #     response = await client.post(
-#     #         f"{audience}/api/1/vehicles/{vehicle_id}/wake_up",
-#     #         headers={"Authorization": f"Bearer {stored['access_token']}"}
-#     #     )
-#     # return response.json()
-#     # wait tesla_get(f"/api/1/vehicles/{vehicle_id}/vehicle_data")
-
-# # @app.get("/vehicles/{vehicle_id}/wake")
-# # async def wake_vehicle(vehicle_id: str):
-# #     stored = get_tokens()
-# #     async with httpx.AsyncClient() as client:
-# #         response = await client.post(
-# #             f"{audience}/api/1/vehicles/{vehicle_id}/wake_up",
-# #             headers={"Authorization": f"Bearer {stored['access_token']}"}
-# #         )
-# #     return response.json()
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)
